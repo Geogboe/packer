@@ -30,3 +30,9 @@ Thumbs.db
 .project
 cache
 /.vscode/
+
+# Test artifacts
+test-results/
+test-run.log
+coverage.out
+coverage.html

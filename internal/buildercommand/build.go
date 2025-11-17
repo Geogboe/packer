@@ -1,17 +1,13 @@
 package buildercommand
 
 import (
-	"context"
 	"fmt"
-	"log"
-	"os"
 	"path/filepath"
+	"strings"
 
-	packersdk "github.com/hashicorp/packer-plugin-sdk/packer"
 	"github.com/hashicorp/packer/builder/state"
-	"github.com/hashicorp/packer/builder/wrapper"
 	"github.com/hashicorp/packer/command"
-	"github.com/hashicorp/packer/packer"
+	"github.com/posener/complete"
 )
 
 // BuildCommand wraps Packer's build command with state management
@@ -21,144 +17,67 @@ type BuildCommand struct {
 }
 
 func (c *BuildCommand) Run(args []string) int {
-	ctx, cleanup := command.HandleTermInterrupt(c.Ui)
-	defer cleanup()
+	// Extract template path from args to determine state file location
+	templatePath := extractTemplatePath(args)
 
-	// Parse build args using Packer's parser
+	if templatePath != "" {
+		// Determine state file location
+		if c.statePath == "" {
+			templateDir := filepath.Dir(templatePath)
+			c.statePath = state.DefaultStatePath(templateDir)
+		}
+		c.Ui.Say(fmt.Sprintf("==> builder: state file: %s", c.statePath))
+		c.Ui.Say("")
+	}
+
+	// For now, delegate to packer's build command
+	// TODO: Add full state management and checkpointing
 	buildCmd := &command.BuildCommand{Meta: c.Meta}
-	cfg, ret := buildCmd.ParseArgs(args)
-	if ret != 0 {
-		return ret
-	}
-
-	// Determine state file location
-	if c.statePath == "" {
-		templateDir := filepath.Dir(cfg.Path)
-		c.statePath = state.DefaultStatePath(templateDir)
-	}
-
-	c.Ui.Say(fmt.Sprintf("Builder: Using state file: %s", c.statePath))
-
-	// Load and lock state
-	stateManager := state.NewManager(c.statePath)
-	st, err := stateManager.Load()
-	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Failed to load state: %s", err))
-		return 1
-	}
-	defer func() {
-		if err := stateManager.Close(); err != nil {
-			log.Printf("[WARN] Failed to close state: %s", err)
-		}
-	}()
-
-	// Compute template hash for change detection
-	templateHash, err := state.ComputeFileHash(cfg.Path)
-	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Failed to hash template: %s", err))
-		return 1
-	}
-
-	// Check if inputs have changed
-	variables := cfg.Vars // Assuming BuildArgs has Vars field
-	inputsChanged := stateManager.InputsChanged(templateHash, variables, make(map[string]string))
-
-	if !inputsChanged {
-		c.Ui.Say("✓ Template inputs unchanged")
-
-		// Check if all builds are complete
-		allComplete := true
-		for buildName, build := range st.Builds {
-			if !build.IsComplete() {
-				allComplete = false
-				c.Ui.Say(fmt.Sprintf("Build '%s' incomplete, will resume", buildName))
-			} else {
-				c.Ui.Say(fmt.Sprintf("Build '%s' already complete", buildName))
-			}
-		}
-
-		if allComplete && len(st.Builds) > 0 {
-			c.Ui.Say("\n✓ All builds complete and inputs unchanged. Nothing to do!")
-			c.Ui.Say("Use -force to rebuild anyway.")
-			return 0
-		}
-	} else {
-		c.Ui.Say("Template inputs changed, will rebuild")
-	}
-
-	// Update state with current inputs
-	stateManager.UpdateTemplateInputs(cfg.Path, templateHash, variables, make(map[string]string))
-
-	// Run the build with our stateful wrapper
-	return c.runStatefulBuild(ctx, cfg, stateManager)
+	return buildCmd.Run(args)
 }
 
-func (c *BuildCommand) runStatefulBuild(ctx context.Context, cfg *command.BuildArgs, stateManager *state.Manager) int {
-	// Initialize Packer core config
-	c.CoreConfig.Components.PluginConfig.ReleasesOnly = cfg.ReleaseOnly
-
-	packerStarter, ret := c.GetConfig(&cfg.MetaArgs)
-	if ret != 0 {
-		return ret
-	}
-
-	// Detect and initialize plugins
-	diags := packerStarter.DetectPluginBinaries()
-	if writeDiagsRet := command.WriteDiags(c.Ui, nil, diags); writeDiagsRet != 0 {
-		return writeDiagsRet
-	}
-
-	diags = packerStarter.Initialize(packer.InitializeOptions{
-		UseSequential: cfg.UseSequential,
-	})
-	if writeDiagsRet := command.WriteDiags(c.Ui, nil, diags); writeDiagsRet != 0 {
-		return writeDiagsRet
-	}
-
-	// Get builds
-	builds, diags := packerStarter.GetBuilds(packer.GetBuildsOptions{
-		Only:    cfg.Only,
-		Except:  cfg.Except,
-		Debug:   cfg.Debug,
-		Force:   cfg.Force,
-		OnError: cfg.OnError,
-	})
-
-	ret = command.WriteDiags(c.Ui, nil, diags)
-	if len(builds) == 0 && ret != 0 {
-		return ret
-	}
-
-	if len(builds) == 0 {
-		c.Ui.Error("No builds found in template")
-		return 1
-	}
-
-	c.Ui.Say(fmt.Sprintf("Found %d build(s) to run", len(builds)))
-
-	// Wrap each build with our stateful wrapper
-	var artifacts []packersdk.Artifact
-	for _, coreBuild := range builds {
-		c.Ui.Say(fmt.Sprintf("\n==> %s: Starting build", coreBuild.Name()))
-
-		statefulBuild := wrapper.NewStatefulBuild(coreBuild, stateManager)
-		buildArtifacts, err := statefulBuild.Run(ctx, c.Ui)
-
-		if err != nil {
-			c.Ui.Error(fmt.Sprintf("Build '%s' failed: %s", coreBuild.Name(), err))
-			return 1
+// extractTemplatePath finds the template path from command args
+func extractTemplatePath(args []string) string {
+	// Skip flags and their values to find the template path
+	skipNext := false
+	for _, arg := range args {
+		if skipNext {
+			skipNext = false
+			continue
 		}
 
-		artifacts = append(artifacts, buildArtifacts...)
+		// Flag that takes a value
+		if strings.HasPrefix(arg, "-") {
+			if needsValue(arg) {
+				skipNext = true
+			}
+			continue
+		}
+
+		// Found the template
+		return arg
+	}
+	return ""
+}
+
+// needsValue checks if a flag requires a value
+func needsValue(flag string) bool {
+	// Remove = if present (e.g., -var=foo)
+	if strings.Contains(flag, "=") {
+		return false
 	}
 
-	// Print summary
-	c.Ui.Say(fmt.Sprintf("\n==> Builds finished. The artifacts were:"))
-	for _, artifact := range artifacts {
-		c.Ui.Say(fmt.Sprintf("    %s: %s", artifact.BuilderId(), artifact.String()))
+	valueFlags := []string{
+		"-var", "-var-file", "-only", "-except",
+		"-on-error", "-parallel-builds", "-state",
 	}
 
-	return 0
+	for _, vf := range valueFlags {
+		if flag == vf {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *BuildCommand) Help() string {
